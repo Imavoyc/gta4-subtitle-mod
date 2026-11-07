@@ -77,6 +77,18 @@ milliseconds. `hash` is `joaat("<rpf base>_<file name>")`. The segment's audio f
 (so file time ≈ `ms × file_duration / len`). Details, evidence and dead ends:
 `docs/RE-NOTES.md`.
 
+## 中文简介
+
+给 GTA IV 加**中文字幕**：电视台（Bink 视频）按帧号走，**电台按段（segment）走**——
+插件直接从游戏内存里读到当前播的是哪一段、已播多少毫秒，再去找对应的
+`plugins/radio/<hash>.<lang>.srt`。字幕是我们自己用 D3D9 画的（自带字库），不依赖汉化包。
+
+**状态：开发中。** 电台时间轴（引擎把整段音频压进自己的 `len`，比例 1.35~1.44×）还有
+一个"哪种模型更准"的实机判定没做完，见 `docs/RE-NOTES.md` 第 3 节。
+
+仓库**只放代码**：游戏本体、RPF 音频、字幕文本、字库位图一律不入库，工具链会从你本地的
+游戏副本现场生成（见上面 Pipeline 一节）。
+
 ## Legal / scope
 
 Personal, non-commercial, educational reverse engineering. This repository ships **code only**;
