@@ -61,7 +61,11 @@ python3 pipeline/night_radio_asr.py ...          # needs GPUSTACK_API_KEY, or po
 python3 pipeline/radio_hash_table.py build --listing rpf_listing.json
 python3 pipeline/radio_hash_table.py index         # hash / channels / file duration
 
-# 4. split per-station SRTs into per-segment ones (times are already segment-relative)
+# 4. (optional) re-time existing cues with word-level timestamps (does not touch the text)
+python3 pipeline/radio_retime.py --asr asr.jsonl --seg-dir seg-all \
+        --en-dir radio-srt --zh-dir zh --out plugins/radio --threads 4
+
+# 5. split per-station SRTs into per-segment ones (times are already segment-relative)
 python3 pipeline/radio_split_tracks.py --en-dir radio-srt --zh-dir zh --out "$GTAIV_DIR/plugins/radio"
 ```
 
