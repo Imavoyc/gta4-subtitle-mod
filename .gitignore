@@ -1,0 +1,16 @@
+build/
+__pycache__/
+*.pyc
+# generated data / game-derived assets — never commit these
+*.bin
+*.rpf
+*.gxt
+*.srt
+*.wav
+*.raw
+*.mkv
+*.mp4
+radio_audio_hash.json
+radio_index.tsv
+glossary.tsv
+*.tsv
