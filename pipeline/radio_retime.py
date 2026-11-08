@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 from collections import defaultdict
 
@@ -129,46 +130,59 @@ def words_of(text):
 
 
 def retime_cues(cues, words, ch_start):
-    """把 cues（通道内的 cue 列表，时间已是绝对文件时间）按词流重新定时。
+    """把通道内的 cue 按词流重新定时（**整通道一次全局对齐**，比逐条对齐稳得多）。
+
+    做法：把本通道所有 cue 的词拼成一条流，和 whisper 的词流做一次 SequenceMatcher，
+    再用"词 → 时间"把每条 cue 匹配到的首/末词映射回时间。
+    单条 cue 匹配不上时保留原时间（并在返回值里体现出来）。
 
     words: [(t0, t1, w)]，时间是相对通道起点的秒。
-    返回 (新 cues, 成功对齐数)。
+    返回 (新 cues, 成功对齐的 cue 数)。
     """
     import difflib
 
-    wtok = [w for _, _, w in words]
-    if not wtok:
+    if not words:
         return cues, 0
+    wtok = [w for _, _, w in words]
+
+    flat = []            # [(cue_idx, token)]
+    spans = []           # 每条 cue 在 flat 里的 [start, end)
+    for i, (_, _, txt) in enumerate(cues):
+        toks = words_of(txt)
+        spans.append((len(flat), len(flat) + len(toks)))
+        flat.extend((i,) * len(toks))
+        flat[-len(toks):] = [(i, t) for t in toks] if toks else []
+    ctok = [t for _, t in flat]
+    if not ctok:
+        return cues, 0
+
+    sm = difflib.SequenceMatcher(None, ctok, wtok, autojunk=False)
+    # 每个 cue 收集匹配到的 whisper 词下标
+    hit_idx = {i: [] for i in range(len(cues))}
+    for b in sm.get_matching_blocks():
+        for k in range(b.size):
+            ci = flat[b.a + k][0]
+            hit_idx[ci].append(b.b + k)
+
     out = list(cues)
     ok = 0
-    pos = 0                       # 词流里已经用掉的游标（顺序约束）
-    for i, (s, e, txt) in enumerate(cues):
+    for i, (s0, e0, txt) in enumerate(cues):
+        idxs = hit_idx.get(i) or []
+        if not idxs:
+            continue
         toks = words_of(txt)
-        if not toks:
+        if toks and len(idxs) / len(toks) < 0.6:
+            continue                       # 只匹配上一半词就别动，容易把 cue 截短
+        a = ch_start + words[idxs[0]][0]
+        b = ch_start + words[idxs[-1]][1] + 0.15
+        if b <= a:
             continue
-        sm = difflib.SequenceMatcher(None, toks, wtok[pos:], autojunk=False)
-        blocks = [b for b in sm.get_matching_blocks() if b.size >= 2] or \
-                 [b for b in sm.get_matching_blocks() if b.size >= 1]
-        if not blocks:
-            continue
-        matched = sum(b.size for b in blocks)
-        if matched / max(len(toks), 1) < 0.45:
-            continue
-        # 注意：block.b 是相对 `wtok[pos:]` 的下标，要加回 pos
-        b0 = pos + blocks[0].b
-        b1 = pos + blocks[-1].b + blocks[-1].size
-        # 词流下标 → 时间
-        def t_at(k, end=False):
-            k = max(0, min(k, len(words) - 1))
-            return words[k][1] if end else words[k][0]
-        start = ch_start + t_at(b0)
-        end = ch_start + t_at(b1 - 1, end=True) + 0.15
-        if end <= start:
-            continue
-        out[i] = [start, end, txt]
+        old = max(e0 - s0, 0.5)
+        if not (0.5 * old <= (b - a) <= 2.0 * old):
+            continue                       # 时长变化太离谱也不动（whisper 漏词会造成这种）
+        out[i] = [a, b, txt]
         ok += 1
-        pos = b1
-    # 修掉重叠/倒序（cue 按时间排好，重叠时截断前一条）
+
     out.sort(key=lambda c: c[0])
     for i in range(len(out) - 1):
         if out[i][1] > out[i + 1][0]:
@@ -253,14 +267,29 @@ def main():
                 fixed_zh += by_ch_zh.get(ch, [])
                 total += len(by_ch_en[ch])
                 continue
-            segs, _info = model.transcribe(audio, language="en", word_timestamps=True,
-                                          vad_filter=False, beam_size=1)
-            words = []
-            for s in segs:
-                for w in (s.words or []):
-                    tok = w.word.strip().lower()
-                    if tok:
-                        words.append((w.start, w.end, tok))
+            # vad_filter + 关掉上下文继承：没有 VAD 时 whisper 在有音乐床的通道上
+            # 会陷入重复解码（实测单通道能跑几分钟），VAD 顺手把纯音乐段切掉也更准。
+            def run(vad):
+                t0 = time.time()
+                segs, _ = model.transcribe(audio, language="en", word_timestamps=True,
+                                           vad_filter=vad, beam_size=1,
+                                           condition_on_previous_text=False)
+                ws = []
+                for s in segs:
+                    for w in (s.words or []):
+                        tok = w.word.strip().lower()
+                        if tok:
+                            ws.append((w.start, w.end, tok))
+                return ws, time.time() - t0
+
+            # 先走 VAD 快路（纯音乐段会被切掉、也不会陷入重复解码）；
+            # 若 VAD 把话也切没了（词数远少于 cue 文本），再退回无 VAD 慢路。
+            words, dt_vad = run(True)
+            expect = sum(len(words_of(c[2])) for c in by_ch_en[ch])
+            if expect and len(words) < 0.4 * expect:
+                words2, dt_raw = run(False)
+                if len(words2) > len(words):
+                    words = words2
             nchan += 1
             ch_start = ch * CLIP
             new_en, ok = retime_cues(by_ch_en[ch], words, ch_start)
