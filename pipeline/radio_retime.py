@@ -293,7 +293,14 @@ def main():
             nchan += 1
             ch_start = ch * CLIP
             new_en, ok = retime_cues(by_ch_en[ch], words, ch_start)
-            new_zh, _ = retime_cues(by_ch_zh.get(ch, []), words, ch_start)
+            # 中文 cue 不能自己对齐（words_of 只认英文词），但中英是**逐条一一对应**的，
+            # 所以直接把英文那边算出来的时间按序号抄过去。条数不一致就保留原时间。
+            zh_ch = by_ch_zh.get(ch, [])
+            src = sorted(new_en, key=lambda c: c[0])
+            if len(zh_ch) == len(src):
+                new_zh = [[src[i][0], src[i][1], zh_ch[i][2]] for i in range(len(zh_ch))]
+            else:
+                new_zh = list(zh_ch)
             fixed_en += new_en
             fixed_zh += new_zh
             total += len(by_ch_en[ch])

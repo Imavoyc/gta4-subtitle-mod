@@ -1,104 +1,119 @@
-# GTA IV Radio Subtitle Mod (WIP)
+# tools/gta4_subtitle — GTA IV 中文字幕 mod（M0 已通）
 
-Real-time **subtitle overlay for GTA IV** (Steam Complete Edition / 1.2.0.59 under Wine+Proton):
-it draws its own text over the game with D3D9, and it can follow the **radio** segment by
-segment, because it reads the audio engine's internal state directly.
+> 对外镜像仓库（**只含代码，不含任何游戏资源/字幕数据**）：
+> https://github.com/Imavoyc/gta4-subtitle-mod —— 这里仍是开发主线，镜像按需同步。
 
-> **Status: work in progress.** Things work in-game today, but the radio timing model is
-> still being verified and some data tables have to be regenerated on your own copy of the
-> game (see below).
+结论与踩坑见 `docs/gta4-subtitle.md`；这里是源码 + 自动化脚本。
 
-## What it does
+目标：给 GTA IV（1.2.0.59 / Complete Edition）的**电台**和**电视台**加中文字幕。
+环境与可行性分析见 `docs/gta4-env.md`。
 
-* **TV (Bink videos)** — subtitles driven by the video frame counter (`BinkOpen`/`BinkDoFrame`).
-* **Radio** — per-segment subtitles. The plugin reads the currently playing segment's
-  *resource hash* and *elapsed milliseconds* out of `CRadioStation` in the game's memory,
-  picks `plugins/radio/<hash>.<lang>.srt`, and scrolls it with the engine clock.
-* **Self-rendered text** — its own glyph atlas (SDF-free, baked bitmap + metrics), drawn through
-  `IDirect3DSwapChain9::Present`, so it does not depend on the game font / any translation patch.
-  Handles CJK line breaking (avoid line-head/line-tail punctuation) and a background bar sized
-  to the real ink box.
-* Hot reload: `.ini` and `.srt` take effect in ~2 s; only the `.asi` needs a game restart.
+## M0 现状：`src/subtitle_test.cpp`
 
-## Repository layout
+最小 ASI，验证「我们自己的插件能不能把 UTF-8 中文画到屏幕上」：
 
-```
-src/            the ASI plugin (C++17, mingw-w64 cross build)
-pipeline/       offline toolchain: RPF audio → ASR → SRT → translation, plus RE probes
-gta4_ctl.sh     game control helpers (launch / quit through menus / screenshots / key taps)
-screen_probe.py pause-menu detection from a screenshot (used by the control script)
-docs/           notes (reverse-engineering details, plugin readme)
-```
+1. **跨平台调用 native**：游戏用一个 hash → handler 的解析函数（`56 8B 35 ? ? ? ? 85 F6 75 06`，
+   CE 里有两份，取第二份 —— 签名与取值方式抄自 FusionFix 的 `comvars.ixx`，CE 验证过）。
+2. **绘制**：`SET_TEXT_*` + `DISPLAY_TEXT_WITH_LITERAL_STRING(x, y, "STRING", utf8)`，
+   位置/缩放/背景都从 ini 读，2 秒内热生效。
+3. **字形**：直接给引擎 UTF-8 中文。汉化包（`GTA4.CHS.asi`）钩的是引擎的文本编码阶段
+   （缓冲区 `ctx+0x48`、游标 `ctx+0x448`），把 UTF-8 映射到 `fonts.wtd` 图集，
+   所以引擎自己的文本通道应该能画出 CJK。
 
-## Build
+构建（32 位 DLL，被 Ultimate ASI Loader 当 `.asi` 加载）：
 
 ```sh
-sudo apt install g++-mingw-w64-i686
 make                       # -> build/GTAIV.SubtitleTest.asi
-cp build/GTAIV.SubtitleTest.asi "$GTAIV_DIR/plugins/"
+cp build/GTAIV.SubtitleTest.asi  "<GTAIV>/plugins/"
+cp GTAIV.SubtitleTest.ini        "<GTAIV>/plugins/"
 ```
 
-Then put `GTAIV.SubtitleTest.ini` next to it (see `docs/plugin-README.md`) and start the game.
-Replace the `.asi` only while the game is **not** running (the process mmaps it).
+ini 键：`Text`（UTF-8）、`X`/`Y`（0..1 屏幕坐标）、`Scale`、`Font`、`Centre`、`Background`。
 
-## Pipeline (bring your own game copy)
+## 字幕语言 / 文件布局（2 秒热生效）
 
-**No game assets are included in this repository** — no `.rpf`, no extracted audio, no subtitle
-text, no hash tables. The tools expect a local installation and generate everything locally:
+同一频道的中英两版都放在 `plugins/` 下，用 ini 切换，**换语言不用重启游戏**：
+
+```
+plugins/weazel.zh.srt   weazel.en.srt      <- Lang=zh / en 决定读哪个
+plugins/CNT.zh.srt      CNT.en.srt
+```
+
+```ini
+Lang=zh          ; 中文（默认）；Lang=en 切英文
+```
+
+插件按 **Bink 总帧数**认频道（77182=weazel、93115=CNT），拼出
+`<频道>.<Lang>.srt`；那份不存在就退回 `<频道>.srt`（只有一份时随便哪种语言）。
+
+## 翻译 / 校对（2026-11-06 新增）
+
+翻译不是"逐句机翻"，而是**AI 初稿 → 一致性复审 → 人工校对**，流程与调研结论见
+`docs/gta4-translation-pipeline.md`。三条命令：
 
 ```sh
-export GTAIV_DIR="$HOME/.steam/steam/steamapps/common/Grand Theft Auto IV/GTAIV"
-
-# 1. turn the radio RPF containers into PCM
-gcc -O2 -o ivaud2pcm pipeline/ivaud2pcm.c
-./ivaud2pcm "$GTAIV_DIR/pc/audio/sfx/radio_wktt.rpf" - --info   # (segments, not the rpf itself)
-
-# 2. speech-to-text: one request per 21.25 s channel, texts only (no timestamps)
-python3 pipeline/night_radio_asr.py ...          # needs GPUSTACK_API_KEY, or point it at any
-                                                # OpenAI-compatible /v1/audio/transcriptions
-
-# 3. engine ↔ file mapping (resource hash = joaat("<rpf base>_<file>"), lower case)
-python3 pipeline/radio_hash_table.py build --listing rpf_listing.json
-python3 pipeline/radio_hash_table.py index         # hash / channels / file duration
-
-# 4. (optional) re-time existing cues with word-level timestamps (does not touch the text)
-python3 pipeline/radio_retime.py --asr asr.jsonl --seg-dir seg-all \
-        --en-dir radio-srt --zh-dir zh --out plugins/radio --threads 4
-
-# 5. split per-station SRTs into per-segment ones (times are already segment-relative)
-python3 pipeline/radio_split_tracks.py --en-dir radio-srt --zh-dir zh --out "$GTAIV_DIR/plugins/radio"
+P=tools/gta4_subtitle/pipeline
+python3 $P/translate_srt.py weazel.en.srt weazel.zh.srt --glossary $P/glossary.tsv   # 初译（夜间）
+python3 $P/translate_srt.py weazel.en.srt weazel.zh.srt --review --glossary $P/glossary.tsv
+python3 $P/qa.py weazel.en.srt weazel.zh.srt --json /tmp/qa.json                    # QA 报告
+python3 tools/gta4_subtitle/review/serve.py --en a.en.srt --zh a.zh.srt            # 人工校对（Web）
 ```
 
-`rpf_listing.json` is the output of [pyrpfiv](https://github.com/…/pyrpfiv) (or any RPF3
-extractor): `{rpf: {directories: [{name, files: [{name, size, offset}]}]}}`.
+- 术语表 `pipeline/glossary.tsv`（原文/译名/类型/备注）：翻译时注入，
+  QA 与复审时用来抓「同词多译」；`glossary.py --suggest x.en.srt` 抽专名候选；
+- QA 阈值按 **Netflix 简体中文 TTSG**：每行 ≤16 字（最多 18）、≤2 行、CPS ≤9（最多 11）、
+  另查时间重叠/字库外字符/未翻译/术语违规；
+- 校对工具是本地 Web（只用标准库）：逐条左右对照、红黄标记、`j/k` 翻页、`s` 保存、
+  `g` 把选中词加进术语表、`AI 压到阅读速度 / 润色` 只改当前条（前后各 3 条只读上下文）。
 
-## How the radio sync works (short version)
+## 自动化
 
-`CRadioStation` has two 0xbd0-byte playback slots. The current slot index is at `+0x1917`;
-inside a slot, `+0x960` points to an 8-byte record `{id, hash}` and `+0x990` is the elapsed
-milliseconds. `hash` is `joaat("<rpf base>_<file name>")`. The segment's audio file contains
-`n` independent 21.248 s clips, and the engine squeezes the whole file into its own `len`
-(so file time ≈ `ms × file_duration / len`). Details, evidence and dead ends:
-`docs/RE-NOTES.md`.
+```sh
+./gta4_ctl.sh boot          # 起游戏：正常退出旧局 -> steam -applaunch（重试）-> 点 RGL OFFLINE -> 等窗口
+./gta4_ctl.sh quit          # **从菜单正常退出**（暂停菜单 -> 游戏 -> 退出 -> 是），失败不强杀
+./gta4_ctl.sh stop          # 结束游戏：先走 quit，失败才强杀；--force 直接强杀
+./gta4_ctl.sh shot name     # 截图
+./gta4_ctl.sh key Escape    # 按键（按住 350ms）
+./gta4_ctl.sh wheel 1 4     # 滚轮切台
+```
 
-## 中文简介
+### 用菜单正常退出（`quit` / `stop`）
 
-给 GTA IV 加**中文字幕**：电视台（Bink 视频）按帧号走，**电台按段（segment）走**——
-插件直接从游戏内存里读到当前播的是哪一段、已播多少毫秒，再去找对应的
-`plugins/radio/<hash>.<lang>.srt`。字幕是我们自己用 D3D9 画的（自带字库），不依赖汉化包。
+**为什么不再强杀**：一天里强杀十几次之后，RGL 会卡在 “Connecting to Rockstar Games
+Services”（`docs/gta4-env.md` 坑 6b），之后连启动都起不来。走菜单退出还会让自动存档落盘。
 
-**状态：开发中。** 电台时间轴（引擎把整段音频压进自己的 `len`，比例 1.35~1.44×）还有
-一个"哪种模型更准"的实机判定没做完，见 `docs/RE-NOTES.md` 第 3 节。
+流程（每一步都用截图判定，不靠盲按键）：
 
-仓库**只放代码**：游戏本体、RPF 音频、字幕文本、字库位图一律不入库，工具链会从你本地的
-游戏副本现场生成（见上面 Pipeline 一节）。
+1. `Escape` 开暂停菜单；如果已经开着就先关再开 —— 让**页签条重新拿到焦点**
+   （焦点在列表里时看到的是 `↑↓ 移动 / ←→ 调整`，在页签条上才是切页签）。
+2. 页签一路 `Right` 到绕回最左 ⇒ 说明上一格就是最右的「游戏」页签（再 `Left` 回一格）。
+3. 列表：刚切过来的页签**方向键完全没反应**，要先按一下 `Return` 把焦点放进列表
+   （只落到第一项，不执行）；然后一路 `Up` 到绕回底部 ⇒ 停在最后一项「退出」。
+4. `Return` → 「确定要退出游戏吗？」（画面几乎全黑、页签条消失）→ `Return` = 是。
+5. 等窗口消失（游戏本体退出）→ 收尾：RGL 的 `Launcher.exe` / `SocialClubHelper.exe`
+   经常不自己退，会拖着 Proton 链让 Steam 以为游戏还在跑 —— 由 `cleanup_after_exit` 杀掉。
 
-## Legal / scope
+截图判定在 `screen_probe.py`（输出 `menu= tab= row= mean=`），三个判据都是分辨率无关的：
 
-Personal, non-commercial, educational reverse engineering. This repository ships **code only**;
-all game content (audio, dialogue, textures, fonts baked from third-party fonts) stays on the
-user's own machine. Do not redistribute extracted game assets.
+- `menu`：暂停菜单有一条满幅、**零方差**的细分隔线（1280x720 时 y=137），上下两行纯黑；
+  游戏画面同一行 std 在 4~19，不会误判。
+- `tab` / `row`：选中项/选中页签是**橙色**（≈RGB 222,142,13），未选是灰（≈120）。
+  `row` 只用来判「按 Up 是否绕回了底部」，不认文案、不数行数，所以 FF/汉化改文案也不影响。
 
-## License
+### 踩出来的键盘规律
 
-MIT for the code in this repository (see `LICENSE`).
+- 按键必须按住 **≥350ms**，瞬发会被吞（0.12s 的连按一个都不认）。
+- 页签只能用**左右方向键**切，鼠标点不动页签（悬停在行上只出一个箭头光标，不选中）。
+- **刚切过来的页签，上下方向键完全没反应**：列表没拿焦点，要按一下 `Return`
+  把焦点放进去（只落在第一项，不执行）；之后上下都能走，并且上下都**绕回**。
+- **RGL 覆盖层抢焦点**：`SocialClubHelper.exe` 被杀了会被 RGL 立刻重拉，重拉那几秒
+  键盘全丢。所以脚本不是一上来就杀它，而是「按键没反应」时才杀 + 重新聚焦再试。
+- 主菜单（标题画面）的「退出」也是列表最后一项，所以拿不到暂停菜单时脚本会直接按列表处理；
+  但那里**不会盲按回车**（第一项是「开始游戏」），只走方向键，找不到绕回就报错退出。
+
+## 已知坑
+
+- 换 `.asi` 必须重启游戏（UAL 只在启动时扫描 `plugins/`）；ini 是 2 秒热生效。
+- **native 只能从主线程每帧钩子里调**（worker 线程调用会被每帧清状态，静默不显示）。
+- 中文长句不会自动换行（引擎按空格断词），要自己做断行。
+- 本机启动项是 `WINEDLLOVERRIDES="dinput8=n,b" %command%`，`dinput8.dll` 就是 UAL。

@@ -29,8 +29,7 @@ ivaud = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ivaud)
 import night_radio_asr as asrmod  # noqa: E402
 
-import gta4env  # noqa: E402
-G = gta4env.GTAIV_DIR
+G = "/home/ydb/.steam/debian-installation/steamapps/common/Grand Theft Auto IV/GTAIV"
 SFX = os.path.join(G, "pc/audio/sfx")
 EXE = os.path.join(G, "GTAIV.exe")
 BANK_NAMES = {"INTRO", "TIME", "TO", "GENERAL"}

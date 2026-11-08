@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GTA IV 字幕校对</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:14px/1.5 system-ui, "Noto Sans CJK SC", sans-serif;
+         background:#16181c; color:#e8e8ea; }
+  header { position:sticky; top:0; background:#1d2026; border-bottom:1px solid #2c313a;
+           padding:8px 14px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; z-index:5 }
+  header b { color:#f0b429 }
+  .btn { background:#2a2f38; border:1px solid #3a414d; color:#dfe3ea; border-radius:6px;
+         padding:4px 10px; cursor:pointer }
+  .btn:hover { background:#333a45 }
+  .btn.primary { background:#2b4f8a; border-color:#3a6cbb }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:0; height:calc(100vh - 52px) }
+  #list { overflow-y:auto; border-right:1px solid #2c313a }
+  .row { display:grid; grid-template-columns: 52px 1fr; gap:8px; padding:8px 10px;
+         border-bottom:1px solid #23262c; cursor:pointer }
+  .row:hover { background:#1b1f25 }
+  .row.sel { background:#23303f; outline:1px solid #3a6cbb }
+  .idx { color:#7c8798; font-variant-numeric:tabular-nums; font-size:12px }
+  .en { color:#b8c0cd; font-size:13px }
+  .zh { color:#fff; margin-top:2px; white-space:pre-wrap }
+  .flags { margin-top:3px; font-size:12px }
+  .err { color:#ff6b6b } .warn { color:#f0b429 }
+  #side { padding:14px 16px; overflow-y:auto }
+  #side h3 { margin:6px 0 4px; font-size:13px; color:#7c8798; font-weight:600 }
+  #enText { color:#c9d0dc; background:#1b1f25; border-radius:8px; padding:10px; white-space:pre-wrap }
+  textarea { width:100%; min-height:84px; box-sizing:border-box; background:#12151a; color:#fff;
+             border:1px solid #3a414d; border-radius:8px; padding:10px; font:inherit; resize:vertical }
+  #issues { margin:8px 0; }
+  #issues div { font-size:13px }
+  #suggest { background:#1b2a1f; border:1px solid #2f5138; border-radius:8px; padding:8px;
+             margin-top:8px; white-space:pre-wrap; display:none }
+  #termBox input { width:46%; background:#12151a; color:#fff; border:1px solid #3a414d;
+                   border-radius:6px; padding:5px }
+  .kv { font-size:12px; color:#7c8798 }
+  kbd { background:#2a2f38; border:1px solid #3a414d; border-radius:4px; padding:0 4px; font-size:12px }
+</style>
+</head>
+<body>
+<header>
+  <b>字幕校对</b>
+  <span id="progress" class="kv"></span>
+  <span class="kv" id="cur"></span>
+  <span style="flex:1"></span>
+  <button class="btn" id="prev">⟨ 上一条 (k)</button>
+  <button class="btn" id="next">下一条 (j) ⟩</button>
+  <button class="btn primary" id="save">保存 (s)</button>
+  <button class="btn" id="aiShorten">AI 压到阅读速度</button>
+  <button class="btn" id="aiPolish">AI 润色</button>
+  <button class="btn" id="addTerm">选中词加术语表 (g)</button>
+</header>
+<main>
+  <div id="list"></div>
+  <div id="side">
+    <h3>原文</h3>
+    <div id="enText">—</div>
+    <h3>译文（可编辑，两行以内）</h3>
+    <textarea id="zhText" spellcheck="false"></textarea>
+    <div id="issues"></div>
+    <div id="suggest"></div>
+    <div id="termBox">
+      <h3>加进术语表</h3>
+      <input id="termEn" placeholder="原文/专名"> <input id="termZh" placeholder="中文译名">
+      <button class="btn" id="termOk">添加</button>
+      <div class="kv">提示：在译文里选中一段文字再点“选中词加术语表”，会把选中的中文填进来；原文需要手动填。</div>
+    </div>
+    <h3>术语表命中</h3>
+    <div id="termsHit" class="kv"></div>
+    <h3>快捷键</h3>
+    <div class="kv"><kbd>j</kbd>/<kbd>k</kbd> 上下条 · <kbd>s</kbd> 保存 · <kbd>g</kbd> 加术语 · 编辑框内回车换行</div>
+  </div>
+</main>
+<script>
+let cues = [], terms = [], sel = 0, dirty = new Set();
+
+const $ = (id) => document.getElementById(id);
+
+async function load() {
+  const r = await fetch('/api/data');
+  const d = await r.json();
+  cues = d.cues; terms = d.terms;
+  render();
+}
+
+function flagsFor(c) {
+  return c.issues.map(([sev, msg]) =>
+    `<div class="${sev === 'err' ? 'err' : 'warn'}">${sev === 'err' ? '✖' : '!'} ${msg}</div>`).join('');
+}
+
+function render() {
+  const list = $('list');
+  list.innerHTML = cues.map((c, i) => `
+    <div class="row ${i === sel ? 'sel' : ''}" data-i="${i}">
+      <div class="idx">${c.i}<br><span class="kv">${c.cps}</span></div>
+      <div>
+        <div class="en">${esc(c.en)}</div>
+        <div class="zh">${esc(c.zh) || '<i style="color:#666">（空）</i>'}</div>
+        <div class="flags">${flagsFor(c)}</div>
+      </div>
+    </div>`).join('');
+  const el = list.querySelector('.row.sel');
+  if (el) el.scrollIntoView({ block: 'nearest' });
+  list.querySelectorAll('.row').forEach(r =>
+    r.onclick = () => { commit(); sel = +r.dataset.i; render(); });
+
+  const c = cues[sel];
+  if (!c) return;
+  $('cur').textContent = `cue ${c.i} · ${c.t0} → ${c.t1}`;
+  $('enText').textContent = c.en;
+  $('zhText').value = c.zh;
+  $('issues').innerHTML = flagsFor(c) || '<span class="kv">无问题</span>';
+  $('suggest').style.display = 'none';
+  const hit = terms.filter(t => c.en.toLowerCase().includes(t.term.toLowerCase()));
+  $('termsHit').innerHTML = hit.length
+    ? hit.map(t => `${t.term} → <b>${t.zh}</b>${c.zh.includes(t.zh) ? ' ✓' : ' <span class="err">✗</span>'}`).join('<br>')
+    : '（本条没有命中术语）';
+  const nerr = cues.reduce((n, c) => n + c.issues.filter(([s]) => s === 'err').length, 0);
+  $('progress').textContent = `${cues.length} 条 · ${nerr} 处错误 · 第 ${sel + 1} 条`;
+}
+
+function esc(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function commit() {
+  const c = cues[sel];
+  if (!c) return;
+  const v = $('zhText').value;
+  if (v !== c.zh) { c.zh = v; dirty.add(c.i); }
+}
+
+async function save() {
+  commit();
+  const payload = { cues: [...dirty].map(i => ({ i, zh: (cues.find(c => c.i === i) || {}).zh || '' })) };
+  const r = await fetch('/api/save', { method: 'POST', body: JSON.stringify(payload) });
+  const d = await r.json();
+  cues = d.cues; terms = d.terms; dirty.clear();
+  render();
+}
+
+$('prev').onclick = () => { commit(); sel = Math.max(0, sel - 1); render(); };
+$('next').onclick = () => { commit(); sel = Math.min(cues.length - 1, sel + 1); render(); };
+$('save').onclick = save;
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
+    if (e.key === 's' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+    return;
+  }
+  if (e.key === 'j') { commit(); sel = Math.min(cues.length - 1, sel + 1); render(); }
+  if (e.key === 'k') { commit(); sel = Math.max(0, sel - 1); render(); }
+  if (e.key === 's') { e.preventDefault(); save(); }
+  if (e.key === 'g') { e.preventDefault(); addTermFromSelection(); }
+});
+
+async function ai(action, ask) {
+  commit();
+  const c = cues[sel];
+  const r = await fetch('/api/ai', { method: 'POST', body: JSON.stringify({ i: c.i, action, ask }) });
+  const d = await r.json();
+  const box = $('suggest');
+  box.style.display = 'block';
+  box.textContent = d.ok ? d.text : ('AI 失败: ' + d.error);
+  box.onclick = () => { $('zhText').value = d.text; };
+}
+$('aiPolish').onclick = () => ai('polish');
+$('aiShorten').onclick = () => ai('shorten');
+
+function addTermFromSelection() {
+  const ta = $('zhText');
+  const selText = ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
+  $('termZh').value = selText;
+  $('termEn').focus();
+}
+$('addTerm').onclick = addTermFromSelection;
+
+$('termOk').onclick = async () => {
+  const body = { term: $('termEn').value.trim(), zh: $('termZh').value.trim() };
+  if (!body.term || !body.zh) return;
+  await fetch('/api/term', { method: 'POST', body: JSON.stringify(body) });
+  $('termEn').value = ''; $('termZh').value = '';
+  await load();
+};
+
+load();
+</script>
+</body>
+</html>

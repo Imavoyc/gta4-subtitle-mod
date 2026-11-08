@@ -29,8 +29,8 @@ APPID=12210
 WINRE='^GTAIV$'
 SHOTDIR="$HOME/tmp/$(date +%F)/gta4-radio"
 export DISPLAY=:0
-export XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+export XAUTHORITY=/home/ydb/.Xauthority
+export XDG_RUNTIME_DIR=/run/user/1000
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 mkdir -p "$SHOTDIR"
 
