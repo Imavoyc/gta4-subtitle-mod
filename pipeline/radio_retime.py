@@ -130,64 +130,91 @@ def words_of(text):
 
 
 def retime_cues(cues, words, ch_start):
-    """把通道内的 cue 按词流重新定时（**整通道一次全局对齐**，比逐条对齐稳得多）。
+    """把通道内的 cue 按词流重新定时。
 
-    做法：把本通道所有 cue 的词拼成一条流，和 whisper 的词流做一次 SequenceMatcher，
-    再用"词 → 时间"把每条 cue 匹配到的首/末词映射回时间。
-    单条 cue 匹配不上时保留原时间（并在返回值里体现出来）。
+    返回 (times, dups)：
+      times = {原 cue 序号: (start, end)}   —— 只有重定时成功的 cue 才在里面
+      dups  = [(原 cue 序号, 偏移秒)]        —— "同一段话连播两遍"时，第二遍要复制的条目
 
-    words: [(t0, t1, w)]，时间是相对通道起点的秒。
-    返回 (新 cues, 成功对齐的 cue 数)。
+    做法：整通道一次全局对齐（拼成一条词流再和 whisper 词流做一次 SequenceMatcher），
+    比逐条对齐稳；再按 token 匹配率 + 整通道覆盖率做两道把关；
+    最后若检测到通道是"双循环"，把 cue 表复制一份到后半段。
     """
     import difflib
 
     if not words:
-        return cues, 0
+        return {}, []
     wtok = [w for _, _, w in words]
-
-    flat = []            # [(cue_idx, token)]
-    spans = []           # 每条 cue 在 flat 里的 [start, end)
+    flat = []
     for i, (_, _, txt) in enumerate(cues):
-        toks = words_of(txt)
-        spans.append((len(flat), len(flat) + len(toks)))
-        flat.extend((i,) * len(toks))
-        flat[-len(toks):] = [(i, t) for t in toks] if toks else []
-    ctok = [t for _, t in flat]
-    if not ctok:
-        return cues, 0
+        for t in words_of(txt):
+            flat.append((i, t))
+    if not flat:
+        return {}, []
 
-    sm = difflib.SequenceMatcher(None, ctok, wtok, autojunk=False)
-    # 每个 cue 收集匹配到的 whisper 词下标
-    hit_idx = {i: [] for i in range(len(cues))}
+    sm = difflib.SequenceMatcher(None, [t for _, t in flat], wtok, autojunk=False)
+    hit = {}
     for b in sm.get_matching_blocks():
         for k in range(b.size):
-            ci = flat[b.a + k][0]
-            hit_idx[ci].append(b.b + k)
+            hit.setdefault(flat[b.a + k][0], []).append(b.b + k)
 
-    out = list(cues)
-    ok = 0
+    times = {}
     for i, (s0, e0, txt) in enumerate(cues):
-        idxs = hit_idx.get(i) or []
-        if not idxs:
-            continue
+        idxs = hit.get(i) or []
         toks = words_of(txt)
-        if toks and len(idxs) / len(toks) < 0.6:
-            continue                       # 只匹配上一半词就别动，容易把 cue 截短
+        if not idxs or (toks and len(idxs) / len(toks) < 0.55):
+            continue
         a = ch_start + words[idxs[0]][0]
         b = ch_start + words[idxs[-1]][1] + 0.15
-        if b <= a:
-            continue
         old = max(e0 - s0, 0.5)
-        if not (0.5 * old <= (b - a) <= 2.0 * old):
-            continue                       # 时长变化太离谱也不动（whisper 漏词会造成这种）
-        out[i] = [a, b, txt]
-        ok += 1
+        if b <= a or (b - a) < 0.4 or not (0.25 * old <= (b - a) <= 4.0 * old):
+            continue
+        times[i] = (a, b)
 
-    out.sort(key=lambda c: c[0])
-    for i in range(len(out) - 1):
-        if out[i][1] > out[i + 1][0]:
-            out[i][1] = max(out[i][0] + 0.4, out[i + 1][0] - 0.02)
-    return out, ok
+    if not times:
+        return {}, []
+
+    # 先算把"双循环"补起来之后的有效覆盖，再拿它跟原来比 —— 顺序反了会把
+    # 本来就该复制的通道当成"缩水"毙掉（踩过）
+    old_span = sum(max(e0 - s0, 0.0) for s0, e0, _ in cues)
+    base_span = sum(b - a for a, b in times.values())
+    # 复读检测（不靠"词序列重复率"，那个不可靠）：如果**大半个词流没被对齐上**，
+    # 说明这段音频把同一段话播了两遍（ASR 文本里被 dedupe 成一遍），
+    # 那就把还没用到的词再对齐一次，产出第二份 cue（时间按真实词时间）。
+    dups2 = []
+    used = [max(v) for v in hit.values()] if hit else []
+    last_used = max(used) if used else -1
+    tail_from = last_used + 1
+    if tail_from >= 8 and len(wtok) - tail_from >= 10:
+        sub = wtok[tail_from:]
+        flat2 = [(i, t) for i, (_, _, txt) in enumerate(cues) for t in words_of(txt)]
+        if flat2:
+            sm2 = difflib.SequenceMatcher(None, [t for _, t in flat2], sub, autojunk=False)
+            hit2 = {}
+            for b in sm2.get_matching_blocks():
+                for k2 in range(b.size):
+                    hit2.setdefault(flat2[b.a + k2][0], []).append(tail_from + b.b + k2)
+            for i in list(times.keys()):
+                idxs = hit2.get(i) or []
+                toks = words_of(cues[i][2])
+                if not idxs or (toks and len(idxs) / len(toks) < 0.55):
+                    continue
+                a2 = ch_start + words[idxs[0]][0]
+                b2 = ch_start + words[idxs[-1]][1] + 0.15
+                if b2 - a2 < 0.4:
+                    continue
+                dups2.append((i, a2, b2))
+    dups = dups2
+    eff_span = base_span + sum(b2 - a2 for _i, a2, b2 in dups)
+    old_lo, old_hi = min(c[0] for c in cues), max(c[1] for c in cues)
+    lo = min(a for a, _ in times.values())
+    hi = max([b for _, b in times.values()] + [b2 for _i, _a2, b2 in dups])
+    if old_span > 1.0 and not (0.6 * old_span <= eff_span <= 1.8 * old_span):
+        return {}, []
+    if (old_hi - old_lo) > 2.0 and (hi - lo) < 0.6 * (old_hi - old_lo):
+        return {}, []
+
+    return times, dups
 
 
 def main():
@@ -209,7 +236,9 @@ def main():
 
     import radio_hash_table as HT
     table = HT.load()
-    key2hash = {e["file"].lower(): h for h, e in table.items()}
+    # ⚠️ 必须按 (rpf, 文件名) 建索引：ID_01 / SOLO_02 这类名字每个台都有，
+    # 只按文件名会互相覆盖（写出来的 SRT 数量会莫名少一半，插件还会显示别的台的词）
+    key2hash = {(e["rpf"][:-4], e["file"].lower()): h for h, e in table.items()}
 
     # 需要处理的通道：asr.jsonl 里每个 (station, file, ch) 一条
     need = defaultdict(set)                      # (station, file) -> {ch}
@@ -269,6 +298,15 @@ def main():
                 continue
             # vad_filter + 关掉上下文继承：没有 VAD 时 whisper 在有音乐床的通道上
             # 会陷入重复解码（实测单通道能跑几分钟），VAD 顺手把纯音乐段切掉也更准。
+            cache = os.path.join(a.out, "words", f"{station}__{fname}__{ch}.json")
+            words_cache = None
+            if os.path.exists(cache):
+                try:
+                    rows = json.load(open(cache, encoding="utf-8"))
+                    words_cache = [(r[0], r[1], r[2]) for r in rows]
+                except Exception:
+                    words_cache = None
+
             def run(vad):
                 t0 = time.time()
                 segs, _ = model.transcribe(audio, language="en", word_timestamps=True,
@@ -282,25 +320,41 @@ def main():
                             ws.append((w.start, w.end, tok))
                 return ws, time.time() - t0
 
-            # 先走 VAD 快路（纯音乐段会被切掉、也不会陷入重复解码）；
-            # 若 VAD 把话也切没了（词数远少于 cue 文本），再退回无 VAD 慢路。
-            words, dt_vad = run(True)
             expect = sum(len(words_of(c[2])) for c in by_ch_en[ch])
-            if expect and len(words) < 0.4 * expect:
-                words2, dt_raw = run(False)
-                if len(words2) > len(words):
-                    words = words2
+            if words_cache is not None:
+                words = words_cache
+            else:
+                # 先走 VAD 快路（纯音乐段会被切掉、也不会陷入重复解码）；
+                # 若 VAD 把话也切没了（词数远少于 cue 文本），再退回无 VAD 慢路。
+                words, _dt = run(True)
+                if expect and len(words) < 0.4 * expect:
+                    words2, _dt2 = run(False)
+                    if len(words2) > len(words):
+                        words = words2
+                os.makedirs(os.path.dirname(cache), exist_ok=True)
+                with open(cache, "w", encoding="utf-8") as cf:
+                    json.dump([[w[0], w[1], w[2]] for w in words], cf)
             nchan += 1
             ch_start = ch * CLIP
-            new_en, ok = retime_cues(by_ch_en[ch], words, ch_start)
-            # 中文 cue 不能自己对齐（words_of 只认英文词），但中英是**逐条一一对应**的，
-            # 所以直接把英文那边算出来的时间按序号抄过去。条数不一致就保留原时间。
+            times, dups = retime_cues(by_ch_en[ch], words, ch_start)
+            # 中文 cue 不能自己对英文词流对齐；但中英逐条一一对应 → 按序号抄英文的时间，
+            # 英文那边"循环复制"的条目，中文也照样复制。
             zh_ch = by_ch_zh.get(ch, [])
-            src = sorted(new_en, key=lambda c: c[0])
-            if len(zh_ch) == len(src):
-                new_zh = [[src[i][0], src[i][1], zh_ch[i][2]] for i in range(len(zh_ch))]
+            if len(zh_ch) == len(by_ch_en[ch]):
+                new_en = [[times[i][0], times[i][1], c[2]] if i in times else list(c)
+                          for i, c in enumerate(by_ch_en[ch])]
+                new_zh = [[times[i][0], times[i][1], zh_ch[i][2]] if i in times else list(zh_ch[i])
+                          for i in range(len(zh_ch))]
+                for i, a2, b2 in dups:
+                    tt = new_en[i][2]           # 别用 a/b（`a` 是 argparse 的 namespace！）
+                    new_en.append([a2, b2, tt])
+                    tt = new_zh[i][2]
+                    new_zh.append([a2, b2, tt])
             else:
+                new_en = [[times[i][0], times[i][1], c[2]] if i in times else list(c)
+                          for i, c in enumerate(by_ch_en[ch])]
                 new_zh = list(zh_ch)
+            ok = len(times)
             fixed_en += new_en
             fixed_zh += new_zh
             total += len(by_ch_en[ch])
@@ -308,7 +362,7 @@ def main():
         if not fixed_en:            # 被 --limit 截断时不要写空文件覆盖已有结果
             stats.append((station, fname, total, done, "skipped"))
             continue
-        h = key2hash.get(fname.lower())
+        h = key2hash.get((station, fname.lower()))
         if h:
             for lang, cues in (("en", fixed_en), ("zh", fixed_zh)):
                 if not cues:
